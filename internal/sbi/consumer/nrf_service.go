@@ -2,7 +2,6 @@ package consumer
 
 import (
 	"context"
-	"strings"
 	"sync"
 	"time"
 
@@ -15,7 +14,12 @@ import (
 	Nnrf_NFDiscovery "github.com/free5gc/openapi/nrf/NFDisc"
 	Nnrf_NFManagement "github.com/free5gc/openapi/nrf/NFMgmt"
 	sbi_metrics "github.com/free5gc/util/metrics/sbi"
+	"github.com/free5gc/util/nfheartbeat"
 )
+
+// registerRetryInterval is the wait between two NFRegister attempts while the NRF
+// is unreachable.
+const registerRetryInterval = 2 * time.Second
 
 type nnrfService struct {
 	consumer *Consumer
@@ -25,6 +29,14 @@ type nnrfService struct {
 
 	nfMngmntClients map[string]*Nnrf_NFManagement.APIClient
 	nfDiscClients   map[string]*Nnrf_NFDiscovery.APIClient
+
+	heartbeat *nfheartbeat.Runner
+
+	// heartbeatTimer is the interval in seconds last assigned in a registration
+	// response; PATCH-adopted values live in the Runner. Set by the startup
+	// registration before the heartbeat goroutine starts, then only rewritten
+	// from re-registrations on that same goroutine.
+	heartbeatTimer int32
 }
 
 func (s *nnrfService) getNFManagementClient(uri string) *Nnrf_NFManagement.APIClient {
@@ -123,65 +135,122 @@ func (s *nnrfService) SendDeregisterNFInstance() (*models.ProblemDetails, error)
 	return nil, err
 }
 
-func (s *nnrfService) RegisterNFInstance(ctx context.Context) (
-	resouceNrfUri string, retrieveNfInstanceID string, err error,
-) {
+// RegisterNFInstance registers the NF profile with the NRF, retrying until it
+// succeeds or ctx is canceled. applyOAuth2 must be true only for the startup
+// registration: it writes OAuth2Required, which SBI handlers read concurrently
+// once the server is running.
+//
+// The profile keeps chfContext.NfId: NFRegister is a PUT on the instance ID the
+// CHF chose, per 3GPP TS 29.510 clause 6.1.3.2.2.
+func (s *nnrfService) RegisterNFInstance(ctx context.Context, applyOAuth2 bool) error {
 	chfContext := s.consumer.Context()
 	client := s.getNFManagementClient(chfContext.NrfUri)
-	nfProfile, err := s.buildNfProfile(chfContext)
-	if err != nil {
-		return "", "", errors.Wrap(err, "RegisterNFInstance buildNfProfile()")
+	if client == nil {
+		return errors.Errorf("RegisterNFInstance: nrf not found")
 	}
 
-	var nf models.Nrf_NFMgmt_NFProfile
+	nfProfile, err := s.buildNfProfile(chfContext)
+	if err != nil {
+		return errors.Wrap(err, "RegisterNFInstance buildNfProfile()")
+	}
+
 	var res *Nnrf_NFManagement.RegisterNFInstanceResponse
 	registerNFInstanceRequest := &Nnrf_NFManagement.RegisterNFInstanceRequest{
 		NfInstanceID: &chfContext.NfId,
 		RequestBody:  &nfProfile,
 	}
-	for {
+	for ctx.Err() == nil {
+		res, err = client.NFInstanceIDDocumentApi.RegisterNFInstance(ctx, registerNFInstanceRequest)
+		if err == nil && res != nil {
+			var nf models.Nrf_NFMgmt_NFProfile
+			if res.Nrf_NFMgmt_NFProfile != nil {
+				nf = *res.Nrf_NFMgmt_NFProfile
+			}
+			s.processRegisterResponse(chfContext, nf, applyOAuth2)
+			return nil
+		}
+		logger.ConsumerLog.Errorf("CHF register to NRF Error[%v]", err)
 		select {
 		case <-ctx.Done():
-			return "", "", errors.Errorf("Context Cancel before RegisterNFInstance")
-		default:
-		}
-		res, err = client.NFInstanceIDDocumentApi.RegisterNFInstance(ctx, registerNFInstanceRequest)
-		if err != nil || res == nil {
-			logger.ConsumerLog.Errorf("CHF register to NRF Error[%v]", err)
-			time.Sleep(2 * time.Second)
-			continue
-		}
-		if res.Nrf_NFMgmt_NFProfile != nil {
-			nf = *res.Nrf_NFMgmt_NFProfile
-		}
-
-		// http.StatusOK
-		if res.Location == "" {
-			// NFUpdate
-			break
-		} else { // http.StatusCreated
-			// NFRegister
-			resourceUri := res.Location
-			resouceNrfUri = resourceUri[:strings.Index(resourceUri, "/nnrf-nfm/")]
-			retrieveNfInstanceID = resourceUri[strings.LastIndex(resourceUri, "/")+1:]
-
-			oauth2 := false
-			if customInfo, isMap := nf.CustomInfo.(map[string]interface{}); isMap {
-				v, ok := customInfo["oauth2"].(bool)
-				if ok {
-					oauth2 = v
-					logger.MainLog.Infoln("OAuth2 setting receive from NRF:", oauth2)
-				}
-			}
-			chf_context.GetSelf().OAuth2Required = oauth2
-			if oauth2 && chf_context.GetSelf().NrfCertPem == "" {
-				logger.CfgLog.Error("OAuth2 enable but no nrfCertPem provided in config.")
-			}
-
-			break
+		case <-time.After(registerRetryInterval):
 		}
 	}
-	return resouceNrfUri, retrieveNfInstanceID, err
+	return errors.Errorf("Context Cancel before RegisterNFInstance")
+}
+
+// processRegisterResponse adopts what the NRF answered to the NFRegister PUT: the
+// heartbeat interval and the oauth2 custom info.
+func (s *nnrfService) processRegisterResponse(
+	chfContext *chf_context.CHFContext,
+	nf models.Nrf_NFMgmt_NFProfile,
+	applyOAuth2 bool,
+) {
+	s.heartbeatTimer = nf.HeartBeatTimer
+
+	oauth2 := false
+	if customInfo, isMap := nf.CustomInfo.(map[string]interface{}); isMap {
+		if v, ok := customInfo["oauth2"].(bool); ok {
+			oauth2 = v
+			logger.MainLog.Infoln("OAuth2 setting receive from NRF:", oauth2)
+		}
+	}
+	if applyOAuth2 {
+		chfContext.OAuth2Required = oauth2
+		if oauth2 && chfContext.NrfCertPem == "" {
+			logger.CfgLog.Error("OAuth2 enable but no nrfCertPem provided in config.")
+		}
+	} else if oauth2 != chfContext.OAuth2Required {
+		logger.ConsumerLog.Warnf("NRF OAuth2 setting changed to %v, restart CHF to apply it", oauth2)
+	}
+}
+
+// SendUpdateNFInstance sends an NFUpdate PATCH to the NRF, honoring ctx. The
+// raw err comes back alongside any ProblemDetails so callers can read its
+// GenericOpenAPIError status.
+func (s *nnrfService) SendUpdateNFInstance(ctx context.Context, patchItem []models.PatchItem) (
+	nf models.Nrf_NFMgmt_NFProfile, problemDetails *models.ProblemDetails, err error,
+) {
+	chfContext := s.consumer.Context()
+	tokCtx, pd, err := chfContext.GetTokenCtx(
+		models.Nrf_NFMgmt_ServiceName_NNRF_NFM,
+		models.Nrf_NFMgmt_NFType_NRF,
+	)
+	if err != nil {
+		return nf, pd, err
+	}
+	// GetTokenCtx takes no parent, so the token request stays uncancellable;
+	// transplanting the token lets at least the PATCH honor ctx.
+	if tok := tokCtx.Value(openapi.ContextOAuth2); tok != nil {
+		ctx = context.WithValue(ctx, openapi.ContextOAuth2, tok)
+	}
+
+	client := s.getNFManagementClient(chfContext.NrfUri)
+	if client == nil {
+		return nf, nil, errors.Errorf("SendUpdateNFInstance: nrf not found")
+	}
+
+	request := &Nnrf_NFManagement.UpdateNFInstanceRequest{
+		NfInstanceID: &chfContext.NfId,
+		RequestBody:  patchItem,
+	}
+
+	res, err := client.NFInstanceIDDocumentApi.UpdateNFInstance(ctx, request)
+	if err != nil {
+		var apiErr openapi.GenericOpenAPIError
+		if errors.As(err, &apiErr) {
+			if updateErr, okModel := apiErr.Model().(Nnrf_NFManagement.UpdateNFInstanceError); okModel {
+				return nf, updateErr.ProblemDetails, err
+			}
+		}
+		return nf, nil, err
+	}
+	if res == nil {
+		return nf, nil, errors.Errorf("empty NFUpdate response")
+	}
+	if res.Nrf_NFMgmt_NFProfile != nil {
+		nf = *res.Nrf_NFMgmt_NFProfile
+	}
+	return nf, nil, nil
 }
 
 func (s *nnrfService) buildNfProfile(
